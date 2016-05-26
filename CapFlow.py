@@ -9,10 +9,11 @@ from ryu.controller.handler import MAIN_DISPATCHER
 from ryu.controller.handler import HANDSHAKE_DISPATCHER
 from ryu.controller.handler import set_ev_cls
 from ryu.controller import ofp_event
-from ryu.lib.packet import ethernet, ipv4, tcp, udp
+from ryu.lib.packet import ethernet, ipv4, tcp, udp, dhcp
 from ryu.lib.packet import packet
 from ryu.ofproto import ether
 from ryu.ofproto import ofproto_v1_3
+
 
 # Ryu - REST API
 from ryu.app.wsgi import WSGIApplication
@@ -65,6 +66,9 @@ class CapFlow(app_manager.RyuApp):
             priority=2,
         )
 
+        
+        
+        
         # So we don't need to learn auth server location
         # TODO: this assumes we are controlling only a single switch!
         port = config.AUTH_SERVER_PORT
@@ -86,8 +90,8 @@ class CapFlow(app_manager.RyuApp):
 
         dpid = datapath.id
 
-        self.logger.info("packet at switch %s from %s to %s (port %s)",
-                         dpid, nw_src, nw_dst, in_port)
+        self.logger.info("packet type %s at switch %s from %s to %s (port %s)",
+                         eth.ethertype , dpid, nw_src, nw_dst, in_port)
 
         if nw_src not in self.mac_to_port[dpid]:
             print "New client: dpid", dpid, "mac", nw_src, "port", in_port
@@ -106,19 +110,69 @@ class CapFlow(app_manager.RyuApp):
 
         # pass ARP through, defaults to flooding if destination unknown
         if eth.ethertype == Proto.ETHER_ARP:
-            self.logger.info("ARP")
+            self.logger.info("ARP, buffer id: " + str(msg.buffer_id))
             port = self.mac_to_port[dpid].get(nw_dst, ofproto.OFPP_FLOOD)
 
             out = parser.OFPPacketOut(
                     datapath=datapath,
                     buffer_id=msg.buffer_id,
                     in_port=in_port,
-                    actions=[parser.OFPActionOutput(port)],
-                    data=msg.data,
-                )
+                    actions=[parser.OFPActionOutput(port)])#,
+                    #data=msg.data,
+                #)
+            self.logger.info(port)
             datapath.send_msg(out)
             return
 
+        if eth.ethertype == Proto.ETHER_IP:
+            ip = pkt.get_protocols(ipv4.ipv4)[0]
+            if ip.proto == Proto.IP_UDP:
+                dh = pkt.get_protocols(dhcp.dhcp)[0]
+                if dh is not None:
+                    self.logger.info("this is a dhcp packet")
+                    if dh.op == 1:
+                        # request
+                        self.logger.info("sending dhcp request to gateway")
+                        # allow the dhcp request/discover
+                        '''util.add_flow(datapath,
+                                parser.OFPMatch(
+                                    eth_dst="FF:FF:FF:FF:FF:FF",
+                                    eth_type=Proto.ETHER_IP,
+                                    ipv4_src="0.0.0.0",
+                                    ipv4_dst="255.255.255.255",
+                                    ip_proto=Proto.IP_UDP,
+                                    udp_dst=67,
+                                    udp_src=68
+                                ),
+                                [parser.OFPActionOutput(config.GATEWAY_PORT)],
+                                priority=30
+                            )'''
+                        out = parser.OFPPacketOut(
+                            datapath=datapath,
+                            buffer_id=msg.buffer_id,
+                            in_port=in_port,
+                            actions=[parser.OFPActionOutput(config.GATEWAY_PORT)])#,
+                            
+                        
+                        datapath.send_msg(out)
+                        return
+                    elif dh.op == 2:
+                        self.logger.info("dhcp reply, flooding if unknown dest")
+                        # todo change this so we dont flood.
+                        p = self.mac_to_port[dpid][nw_dst]
+                        
+                        out = parser.OFPPacketOut(
+                        datapath=datapath,
+                        buffer_id=msg.buffer_id,
+                        in_port=in_port,
+                        actions=[parser.OFPActionOutput(p)])
+                        
+                        datapath.send_msg(out)
+                        return
+                        
+                else:
+                    self.logger.info("this wasnt a dhcp packet")
+            
         # Non-ARP traffic to unknown L2 destination is dropped
         if nw_dst not in self.mac_to_port[dpid]:
             self.logger.info("Unknown destination!")
@@ -139,7 +193,21 @@ class CapFlow(app_manager.RyuApp):
                 msg=msg, in_port=in_port,
             )
 
-        def install_dns_fwd(nw_src, nw_dst, out_port):
+        def install_dns_fwd(nw_src, nw_dst, out_port, src_port):
+            # dns response packet
+            util.add_flow(datapath,
+                parser.OFPMatch(
+                    eth_src=nw_dst,
+                    eth_dst=nw_src,
+                    eth_type=Proto.ETHER_IP,
+                    ip_proto=Proto.IP_UDP,
+                    udp_dst=src_port,
+                ),
+                [parser.OFPActionOutput(in_port)],
+                priority=101,
+                msg=msg, in_port=out_port,
+            )
+            # dns query packets
             util.add_flow(datapath,
                 parser.OFPMatch(
                     eth_src=nw_src,
@@ -152,6 +220,7 @@ class CapFlow(app_manager.RyuApp):
                 priority=100,
                 msg=msg, in_port=in_port,
             )
+            
 
         def install_http_nat(nw_src, nw_dst, ip_src, ip_dst, tcp_src, tcp_dst):
             # TODO: we do not change port right now so it might collide with
@@ -238,7 +307,7 @@ class CapFlow(app_manager.RyuApp):
 
         # Client authenticated but destination not, just block it
         if self.authenticate[ip.src]:
-            self.logger.info("Auth client sending to non-auth destination blocked!")
+            self.logger.info("Auth client sending to non-auth destination blocked!"+ str(ip.dst))
             return
         # Client is not authenticated
         if ip.proto == 1:
@@ -248,9 +317,9 @@ class CapFlow(app_manager.RyuApp):
             _udp = pkt.get_protocols(udp.udp)[0]
             if _udp.dst_port == Proto.UDP_DNS:
                 self.logger.info("Install DNS bypass")
-                install_dns_fwd(nw_src, nw_dst, out_port)
+                install_dns_fwd(nw_src, nw_dst, out_port, _udp.src_port)
             else:
-                self.logger.info("Unknown UDP proto, ignore")
+                self.logger.info("Unknown UDP proto, ignore, port: " + str(_udp.dst_port))
                 return
         elif ip.proto == Proto.IP_TCP:
             _tcp = pkt.get_protocols(tcp.tcp)[0]
@@ -259,5 +328,5 @@ class CapFlow(app_manager.RyuApp):
                 install_http_nat(nw_src, nw_dst, ip.src, ip.dst,
                                  _tcp.src_port, _tcp.dst_port)
         else:
-            self.logger.info("Unknown IP proto, dropping")
+            self.logger.info("Unknown IP proto: " + ip.proto +", dropping")
             drop_unknown_ip(nw_src, nw_dst, ip.proto)
