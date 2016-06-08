@@ -1,4 +1,4 @@
-def add_flow(datapath, match, actions, priority=None, command=None, msg=None,in_port=None):
+def add_flow(datapath, match, actions, priority=None, command=None, msg=None,in_port=None, hard_timeout=0, idle_timeout=0):
     ofproto = datapath.ofproto
     parser = datapath.ofproto_parser
 
@@ -11,7 +11,7 @@ def add_flow(datapath, match, actions, priority=None, command=None, msg=None,in_
                                          actions)]
 
     mod = parser.OFPFlowMod(datapath=datapath, priority=priority,
-                            match=match, instructions=inst, command=command)
+                            match=match, instructions=inst, command=command, idle_timeout=idle_timeout, hard_timeout=hard_timeout)
 
     datapath.send_msg(mod)
     if msg:
